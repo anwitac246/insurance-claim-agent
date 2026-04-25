@@ -48,8 +48,6 @@ env/
 *.pt
 *.pth
 *.onnx
-data/
-datasets/
 models/
 checkpoints/
 *.csv
