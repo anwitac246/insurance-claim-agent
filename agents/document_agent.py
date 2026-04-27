@@ -4,37 +4,38 @@ agents/document_agent.py
 SecureWheel Insurance AI — Document Verification Agent (Agent 2)
 ----------------------------------------------------------------
 Refactored to be modular with components in separate files.
+
+New in this version:
+  - Image summarization via Groq vision model (image_summarizer.py)
+  - ImageDamageSummary stored on ExtractedPhotos for Policy Agent
 """
 
 from __future__ import annotations
 
 import time
+import hashlib
+import logging
+import os
+from pathlib import Path
 from typing import Any
 
-# Import state models
+from pinecone import Pinecone
+from groq import Groq
+from dotenv import load_dotenv
+
 from state import (
     ClaimState, ClaimStatus, DocumentStatus, DocumentAgentOutput,
-    AgentTrace
+    AgentTrace,
 )
-
-# Import our modular components
 from .document_parser import parse_file
 from .document_extractor import extract_document
 from .document_validator import run_validation_checks
 from .document_checker import (
     determine_required_docs,
     find_missing_docs,
-    compute_dcs
+    compute_dcs,
 )
-
-# Import for lazy loading
-from pinecone import Pinecone
-from groq import Groq
-from dotenv import load_dotenv
-import os
-import hashlib
-from pathlib import Path
-import logging
+from .image_summarizer import summarize_images, filter_image_files
 
 load_dotenv()
 
@@ -44,15 +45,12 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(message)s",
 )
 
-# ─────────────────────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────────────────────
-GROQ_MODEL          = "llama-3.3-70b-versatile"
-PINECONE_INDEX      = "insurance-policies"
-DOC_NAMESPACE       = "document_rules"
-POLICY_NAMESPACE    = "policy_rules"
-MAX_RETRIES         = 2     # error budget per file
-PINECONE_TOP_K      = 8     # RAG chunks to retrieve
+GROQ_MODEL       = "llama-3.3-70b-versatile"
+PINECONE_INDEX   = "insurance-policies"
+DOC_NAMESPACE    = "document_rules"
+POLICY_NAMESPACE = "policy_rules"
+MAX_RETRIES      = 2
+PINECONE_TOP_K   = 8
 
 
 class DocumentVerificationAgent:
@@ -69,22 +67,12 @@ class DocumentVerificationAgent:
         self.pc_index = Pinecone(
             api_key=os.getenv("PINECONE_API_KEY")
         ).Index(PINECONE_INDEX)
-        self._embed_query = None    # lazy-load on first use
+        self._embed_query = None
 
-    # ──────────────────────────────────────────────────────────
-    # PUBLIC ENTRY POINT
-    # ──────────────────────────────────────────────────────────
     def run(self, state: ClaimState) -> ClaimState:
-        """
-        Main execution entry point called by LangGraph.
-
-        Returns the mutated ClaimState. LangGraph merges the
-        returned dict/model back into the global state.
-        """
         t_start = time.monotonic()
         log.info(f"[DocumentAgent] Starting — claim_id={state.claim_id}")
 
-        # ── Idempotency check ─────────────────────────────────
         current_hash = self._hash_files(state.raw_files)
         if (
             state.input_hash == current_hash
@@ -103,15 +91,15 @@ class DocumentVerificationAgent:
         state.input_hash = current_hash
         state.extraction_attempt_count += 1
 
-        # ── Step 1: Retrieve policy context from Pinecone ─────
+        # Step 1: Retrieve policy context from Pinecone
         log.info("[DocumentAgent] Querying Pinecone for document requirements...")
         pinecone_context = self._retrieve_policy_context(state.claim_type)
 
-        # ── Step 2: Determine required documents ─────────────
+        # Step 2: Determine required documents
         required_docs = determine_required_docs(state)
         log.info(f"[DocumentAgent] Required docs: {required_docs}")
 
-        # ── Step 3: Parse & extract each uploaded file ────────
+        # Step 3: Parse & extract each uploaded file
         all_extracted: dict[str, Any] = {}
         provided_docs: list[str] = []
         extraction_confidences: list[float] = []
@@ -121,7 +109,8 @@ class DocumentVerificationAgent:
             try:
                 markdown_text = parse_file(raw_file)
                 doc_code, extracted, confidence = extract_document(
-                    raw_file, markdown_text, pinecone_context, self.groq, GROQ_MODEL, MAX_RETRIES
+                    raw_file, markdown_text, pinecone_context,
+                    self.groq, GROQ_MODEL, MAX_RETRIES
                 )
                 if doc_code:
                     all_extracted[doc_code] = extracted
@@ -137,25 +126,41 @@ class DocumentVerificationAgent:
                 if state.extraction_attempt_count > MAX_RETRIES:
                     state.error_budget_exhausted = True
 
-        # ── Step 4: Assemble typed ExtractedDocuments ─────────
+        # Step 4: Assemble typed ExtractedDocuments
         extracted_docs = self._assemble_extracted(all_extracted)
 
-        # ── Step 5: Run validation checks ────────────
+        # Step 5: Image summarization — analyse accident photos
+        image_summary = self._summarize_damage_photos(state, extracted_docs)
+        if image_summary and extracted_docs.photos:
+            extracted_docs.photos.damage_type_detected = image_summary.incident_type_inferred
+            extracted_docs.photos.damage_visible        = bool(image_summary.damage_description)
+            extracted_docs.photos.ai_manipulation_score = image_summary.ai_manipulation_score
+            extracted_docs.photos.image_count           = image_summary.image_count_analysed
+            # Store full summary text for Policy Agent
+            extracted_docs.photos.damage_type_detected  = (
+                f"[{image_summary.incident_type_inferred.upper()}] "
+                f"{image_summary.damage_description} "
+                f"Areas: {', '.join(image_summary.damage_areas)}. "
+                f"Severity: {image_summary.damage_severity}. "
+                f"Consistent with claim: {image_summary.damage_consistent_with_claim}. "
+                f"Observations: {image_summary.raw_observations}"
+            )
+
+        # Step 6: Run validation checks
         validation_errors = run_validation_checks(extracted_docs, state)
 
-        # ── Step 6: Compute Document Completeness Score ───────
+        # Step 7: Compute Document Completeness Score
         missing = find_missing_docs(required_docs, provided_docs, state)
         dcs = compute_dcs(required_docs, provided_docs)
 
-        # ── Step 7: Determine status ──────────────────────────
+        # Step 8: Determine status
         doc_status = self._determine_doc_status(missing, dcs, validation_errors)
 
-        # ── Step 8: Compute agent confidence ──────────────────
+        # Step 9: Compute agent confidence
         confidence_score = self._compute_confidence(
             extracted_docs, dcs, validation_errors, extraction_confidences
         )
 
-        # ── Assemble output ───────────────────────────────────
         output = DocumentAgentOutput(
             status=doc_status,
             document_completeness_score=dcs,
@@ -166,10 +171,9 @@ class DocumentVerificationAgent:
             provided_docs=provided_docs,
             confidence_score=confidence_score,
             extraction_attempts=state.extraction_attempt_count,
-            pinecone_policy_context=pinecone_context[:500],  # truncate for storage
+            pinecone_policy_context=pinecone_context[:500],
         )
 
-        # ── Mutate state ──────────────────────────────────────
         state.document_agent_output = output
         state.validation_errors = validation_errors
         state.missing_documents = missing
@@ -177,7 +181,6 @@ class DocumentVerificationAgent:
             f"{m.doc_code}: {m.doc_name}" for m in missing
         ]
 
-        # Update claim-level status
         self._update_claim_status(state, doc_status)
 
         elapsed_ms = int((time.monotonic() - t_start) * 1000)
@@ -197,15 +200,46 @@ class DocumentVerificationAgent:
         return state
 
     # ──────────────────────────────────────────────────────────
-    # STEP 1: PINECONE RAG
+    # IMAGE SUMMARIZATION
     # ──────────────────────────────────────────────────────────
+
+    def _summarize_damage_photos(self, state: ClaimState, extracted_docs: Any):
+        """
+        Run vision analysis on all uploaded image files.
+        Returns ImageDamageSummary or None if no images present.
+        """
+        image_files = filter_image_files(state.raw_files)
+        if not image_files:
+            log.info("[DocumentAgent] No image files found — skipping image summarization")
+            return None
+
+        log.info(f"[DocumentAgent] Summarizing {len(image_files)} image(s) via vision model...")
+        cf = extracted_docs.claim_form
+        accident_cause = cf.accident_cause if cf else None
+
+        try:
+            summary = summarize_images(
+                image_files=image_files,
+                claim_type=state.claim_type,
+                accident_cause=accident_cause,
+                groq_client=self.groq,
+            )
+            log.info(
+                f"[DocumentAgent] Image summary — severity={summary.damage_severity}, "
+                f"consistent={summary.damage_consistent_with_claim}, "
+                f"manipulation={summary.ai_manipulation_score:.2f}"
+            )
+            return summary
+        except Exception as exc:
+            log.error(f"[DocumentAgent] Image summarization failed: {exc}")
+            return None
+
+    # ──────────────────────────────────────────────────────────
+    # PINECONE RAG
+    # ──────────────────────────────────────────────────────────
+
     def _retrieve_policy_context(self, claim_type: str) -> str:
-        """
-        Query Pinecone document_rules namespace to get the mandatory
-        document checklist for this claim type.
-        """
         if self._embed_query is None:
-            # Import here to avoid circular imports
             from seed_pinecone import embed_query
             self._embed_query = embed_query
 
@@ -227,7 +261,6 @@ class DocumentVerificationAgent:
                 for match in result.matches
                 if match.metadata
             ]
-            # Fallback: metadata may not include text; use section_title
             if not any(chunks):
                 chunks = [
                     f"{match.metadata.get('section_title', '')} "
@@ -245,13 +278,10 @@ class DocumentVerificationAgent:
             return "Pinecone unavailable — using hardcoded policy rules."
 
     # ──────────────────────────────────────────────────────────
-    # STEP 4: ASSEMBLE TYPED MODEL
+    # ASSEMBLE TYPED MODEL
     # ──────────────────────────────────────────────────────────
+
     def _assemble_extracted(self, all_extracted: dict[str, dict]):
-        """
-        Map raw extraction dicts into the typed Pydantic sub-schemas.
-        Unknown keys are silently ignored by Pydantic.
-        """
         from state import (
             ExtractedDocuments, ExtractedRC, ExtractedDL,
             ExtractedPolicySchedule, ExtractedClaimForm,
@@ -277,7 +307,7 @@ class DocumentVerificationAgent:
             claim_form=_safe(ExtractedClaimForm, all_extracted.get("DOC-004")),
             repair_estimate=_safe(ExtractedRepairEstimate, all_extracted.get("DOC-005")),
             fir=_safe(ExtractedFIR, all_extracted.get("DOC-008")),
-            photos=_safe(ExtractedPhotos, all_extracted.get("DOC-011")),
+            photos=_safe(ExtractedPhotos, all_extracted.get("DOC-011")) or ExtractedPhotos(),
             kyc_verified=bool(
                 (all_extracted.get("DOC-010") or {}).get("kyc_verified", False)
             ),
@@ -287,14 +317,13 @@ class DocumentVerificationAgent:
         )
 
     # ──────────────────────────────────────────────────────────
-    # HELPER METHODS
+    # HELPERS
     # ──────────────────────────────────────────────────────────
-    def _determine_doc_status(self, missing, dcs: float, validation_errors) -> DocumentStatus:
-        """Determine document status based on missing docs, DCS, and validation errors."""
-        from state import DocumentStatus
 
+    def _determine_doc_status(self, missing, dcs: float, validation_errors) -> DocumentStatus:
+        from state import DocumentStatus
         tier1_missing = [m for m in missing if m.tier == 1]
-        hard_errors = [e for e in validation_errors if e.severity == "HARD"]
+        hard_errors   = [e for e in validation_errors if e.severity == "HARD"]
 
         if tier1_missing or dcs < 50:
             return DocumentStatus.INCOMPLETE
@@ -305,23 +334,19 @@ class DocumentVerificationAgent:
         else:
             return DocumentStatus.READY
 
-    def _compute_confidence(self, extracted_docs, dcs: float, validation_errors, extraction_confidences: list[float]) -> float:
-        """Compute agent confidence score."""
+    def _compute_confidence(self, extracted_docs, dcs, validation_errors, extraction_confidences):
         avg_extraction_conf = (
             sum(extraction_confidences) / len(extraction_confidences)
             if extraction_confidences else 0.0
         )
-        dcs_conf = dcs / 100.0
+        dcs_conf      = dcs / 100.0
         error_penalty = 0.1 * len([e for e in validation_errors if e.severity == "HARD"])
-        confidence_score = max(0.0, min(1.0,
+        return max(0.0, min(1.0,
             (avg_extraction_conf * 0.6) + (dcs_conf * 0.4) - error_penalty
         ))
-        return confidence_score
 
     def _update_claim_status(self, state: ClaimState, doc_status: DocumentStatus) -> None:
-        """Update claim-level status based on document status."""
         from state import ClaimStatus
-
         if doc_status == DocumentStatus.READY:
             state.status = ClaimStatus.DOCUMENTS_COMPLETE
         elif state.error_budget_exhausted:
@@ -329,68 +354,10 @@ class DocumentVerificationAgent:
         else:
             state.status = ClaimStatus.DOCUMENTS_PENDING
 
-    # ──────────────────────────────────────────────────────────
-    # IDEMPOTENCY HASH
-    # ──────────────────────────────────────────────────────────
     @staticmethod
     def _hash_files(raw_files: list) -> str:
-        """SHA-256 of sorted filenames + sizes — same files = same hash."""
         payload = "|".join(
             f"{f.filename}:{f.size_bytes}"
             for f in sorted(raw_files, key=lambda x: x.filename)
         )
         return hashlib.sha256(payload.encode()).hexdigest()
-
-
-# ─────────────────────────────────────────────────────────────
-# STANDALONE TEST HELPER
-# ─────────────────────────────────────────────────────────────
-def _make_test_state() -> ClaimState:
-    """Create a minimal ClaimState for local testing."""
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent.parent))
-    from state import ClaimState, RawFile
-
-    return ClaimState(
-        claim_id="CLM-2026-TEST01",
-        claim_type="OWN_DAMAGE",
-        claimant_name="Rajesh Kumar",
-        policy_number="SW-MH-2024-00123",
-        vehicle_registration="MH02AB1234",
-        raw_files=[
-            RawFile(
-                filename="registration_certificate.pdf",
-                file_path="/tmp/rc_sample.pdf",
-                doc_type_hint="RC",
-                size_bytes=102400,
-            ),
-            RawFile(
-                filename="drivers_license.pdf",
-                file_path="/tmp/dl_sample.pdf",
-                doc_type_hint="DL",
-                size_bytes=51200,
-            ),
-        ],
-    )
-
-
-if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent.parent))
-
-    logging.basicConfig(level=logging.INFO)
-    state = _make_test_state()
-    agent = DocumentVerificationAgent()
-    updated_state = agent.run(state)
-
-    output = updated_state.document_agent_output
-    print("\n" + "=" * 60)
-    print("DOCUMENT AGENT TEST RESULT")
-    print("=" * 60)
-    print(f"Claim ID    : {updated_state.claim_id}")
-    print(f"Status      : {updated_state.status.value}")
-    print(f"Doc Status  : {output.status.value}")
-    print(f"DCS         : {output.document_completeness_score}%")
-    print(f"Confidence  : {output.confidence_score:.2f}")
-    print(f"Missing Docs: {[m.doc_code for m in output.missing_documents]}")
-    print(f"Hard Errors : {[e.rule for e in output.validation_errors if e.severity == 'HARD']}")
